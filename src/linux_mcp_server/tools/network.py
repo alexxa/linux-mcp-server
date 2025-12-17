@@ -1,15 +1,18 @@
 """Network diagnostic tools."""
 
-import socket
-
-import psutil
-
 from mcp.types import ToolAnnotations
 
 from linux_mcp_server.audit import log_tool_call
-from linux_mcp_server.connection.ssh import execute_command
+from linux_mcp_server.commands import get_command
+from linux_mcp_server.connection.ssh import execute_with_fallback
+from linux_mcp_server.formatters import format_listening_ports
+from linux_mcp_server.formatters import format_network_connections
+from linux_mcp_server.formatters import format_network_interfaces
+from linux_mcp_server.parsers import parse_ip_brief
+from linux_mcp_server.parsers import parse_proc_net_dev
+from linux_mcp_server.parsers import parse_ss_connections
+from linux_mcp_server.parsers import parse_ss_listening
 from linux_mcp_server.server import mcp
-from linux_mcp_server.utils import format_bytes
 from linux_mcp_server.utils.decorators import disallow_local_execution_in_containers
 from linux_mcp_server.utils.types import Host
 
@@ -21,96 +24,39 @@ from linux_mcp_server.utils.types import Host
 )
 @log_tool_call
 @disallow_local_execution_in_containers
-async def get_network_interfaces(  # noqa: C901
+async def get_network_interfaces(
     host: Host | None = None,
 ) -> str:
     """
     Get network interface information.
     """
     try:
-        if host:
-            # Remote execution - use ip command
-            info = []
-            info.append("=== Network Interfaces ===\n")
+        interfaces = {}
+        stats = {}
 
-            # Get interface info
-            returncode, stdout, _ = await execute_command(
-                ["ip", "-brief", "address"],
-                host=host,
-            )
+        # Get brief interface info
+        brief_cmd = get_command("network_interfaces", "brief")
+        returncode, stdout, _ = await execute_with_fallback(
+            brief_cmd.args,
+            fallback=brief_cmd.fallback,
+            host=host,
+        )
 
-            if returncode == 0 and stdout:
-                info.append(stdout)
+        if returncode == 0 and stdout:
+            interfaces = parse_ip_brief(stdout)
 
-            # Get detailed interface info
-            returncode, stdout, _ = await execute_command(
-                ["ip", "address"],
-                host=host,
-            )
+        # Get network statistics from /proc/net/dev
+        stats_cmd = get_command("network_interfaces", "stats")
+        returncode, stdout, _ = await execute_with_fallback(
+            stats_cmd.args,
+            fallback=stats_cmd.fallback,
+            host=host,
+        )
 
-            if returncode == 0 and stdout:
-                info.append("\n=== Detailed Interface Information ===")
-                info.append(stdout)
+        if returncode == 0 and stdout:
+            stats = parse_proc_net_dev(stdout)
 
-            # Get network statistics using netstat or ss
-            returncode, stdout, _ = await execute_command(
-                ["cat", "/proc/net/dev"],
-                host=host,
-            )
-
-            if returncode == 0 and stdout:
-                info.append("\n=== Network I/O Statistics ===")
-                info.append(stdout)
-
-            return "\n".join(info)
-        else:
-            # Local execution - use psutil
-            info = []
-            info.append("=== Network Interfaces ===\n")
-
-            # Get network interface addresses
-            net_if_addrs = psutil.net_if_addrs()
-            net_if_stats = psutil.net_if_stats()
-
-            for interface, addrs in sorted(net_if_addrs.items()):
-                info.append(f"\n{interface}:")
-
-                # Get interface stats
-                if interface in net_if_stats:
-                    stats = net_if_stats[interface]
-                    status = "UP" if stats.isup else "DOWN"
-                    info.append(f"  Status: {status}")
-                    info.append(f"  Speed: {stats.speed} Mbps")
-                    info.append(f"  MTU: {stats.mtu}")
-
-                # Get addresses
-                for addr in addrs:
-                    if addr.family == socket.AF_INET:
-                        info.append(f"  IPv4 Address: {addr.address}")
-                        if addr.netmask:
-                            info.append(f"    Netmask: {addr.netmask}")
-                        if addr.broadcast:
-                            info.append(f"    Broadcast: {addr.broadcast}")
-                    elif addr.family == socket.AF_INET6:
-                        info.append(f"  IPv6 Address: {addr.address}")
-                        if addr.netmask:
-                            info.append(f"    Netmask: {addr.netmask}")
-                    elif addr.family == psutil.AF_LINK:
-                        info.append(f"  MAC Address: {addr.address}")
-
-            # Network I/O statistics
-            net_io = psutil.net_io_counters()
-            info.append("\n\n=== Network I/O Statistics (total) ===")
-            info.append(f"Bytes Sent: {format_bytes(net_io.bytes_sent)}")
-            info.append(f"Bytes Received: {format_bytes(net_io.bytes_recv)}")
-            info.append(f"Packets Sent: {net_io.packets_sent}")
-            info.append(f"Packets Received: {net_io.packets_recv}")
-            info.append(f"Errors In: {net_io.errin}")
-            info.append(f"Errors Out: {net_io.errout}")
-            info.append(f"Drops In: {net_io.dropin}")
-            info.append(f"Drops Out: {net_io.dropout}")
-
-            return "\n".join(info)
+        return format_network_interfaces(interfaces, stats)
     except Exception as e:
         return f"Error getting network interface information: {str(e)}"
 
@@ -129,71 +75,18 @@ async def get_network_connections(
     Get active network connections.
     """
     try:
-        if host:
-            # Remote execution - use ss or netstat command
-            # Try ss first (modern tool)
-            returncode, stdout, _ = await execute_command(
-                ["ss", "-tunap"],
-                host=host,
-            )
+        cmd = get_command("network_connections")
 
-            if returncode == 0 and stdout:
-                info = []
-                info.append("=== Active Network Connections ===\n")
-                info.append(stdout)
+        returncode, stdout, stderr = await execute_with_fallback(
+            cmd.args,
+            fallback=cmd.fallback,
+            host=host,
+        )
 
-                # Count connections
-                lines = stdout.strip().split("\n")
-                info.append(f"\n\nTotal connections: {len(lines) - 1}")  # -1 for header
-
-                return "\n".join(info)
-            else:
-                # Fallback to netstat
-                returncode, stdout, _ = await execute_command(
-                    ["netstat", "-tunap"],
-                    host=host,
-                )
-
-                if returncode == 0 and stdout:
-                    info = []
-                    info.append("=== Active Network Connections ===\n")
-                    info.append(stdout)
-                    return "\n".join(info)
-                else:
-                    return "Error: Neither ss nor netstat command available on remote host"
-        else:
-            # Local execution - use psutil
-            info = []
-            info.append("=== Active Network Connections ===\n")
-            info.append(f"{'Proto':<8} {'Local Address':<30} {'Remote Address':<30} {'Status':<15} {'PID/Program'}")
-            info.append("-" * 110)
-
-            # Get all network connections
-            connections = psutil.net_connections(kind="inet")
-
-            for conn in connections:
-                proto = "TCP" if conn.type == socket.SOCK_STREAM else "UDP"
-
-                local_addr = f"{conn.laddr.ip}:{conn.laddr.port}" if conn.laddr else "N/A"
-                remote_addr = f"{conn.raddr.ip}:{conn.raddr.port}" if conn.raddr else "N/A"
-                status = conn.status if conn.status else "N/A"
-
-                # Try to get process info
-                pid_info = str(conn.pid) if conn.pid else "N/A"
-                if conn.pid:
-                    try:
-                        proc = psutil.Process(conn.pid)
-                        pid_info = f"{conn.pid}/{proc.name()}"
-                    except (psutil.NoSuchProcess, psutil.AccessDenied):
-                        pass
-
-                info.append(f"{proto:<8} {local_addr:<30} {remote_addr:<30} {status:<15} {pid_info}")
-
-            info.append(f"\n\nTotal connections: {len(connections)}")
-
-            return "\n".join(info)
-    except psutil.AccessDenied:
-        return "Permission denied. This tool requires elevated privileges to view all network connections."
+        if returncode == 0 and stdout:
+            connections = parse_ss_connections(stdout)
+            return format_network_connections(connections)
+        return f"Error getting network connections: return code {returncode}, stderr: {stderr}"
     except Exception as e:
         return f"Error getting network connections: {str(e)}"
 
@@ -212,70 +105,17 @@ async def get_listening_ports(
     Get listening ports.
     """
     try:
-        if host:
-            # Remote execution - use ss or netstat command
-            # Try ss first (modern tool)
-            returncode, stdout, _ = await execute_command(
-                ["ss", "-tulnp"],
-                host=host,
-            )
+        cmd = get_command("listening_ports")
 
-            if returncode == 0 and stdout:
-                info = []
-                info.append("=== Listening Ports ===\n")
-                info.append(stdout)
+        returncode, stdout, stderr = await execute_with_fallback(
+            cmd.args,
+            fallback=cmd.fallback,
+            host=host,
+        )
 
-                # Count listening ports
-                lines = stdout.strip().split("\n")
-                info.append(f"\n\nTotal listening ports: {len(lines) - 1}")  # -1 for header
-
-                return "\n".join(info)
-            else:
-                # Fallback to netstat
-                returncode, stdout, _ = await execute_command(
-                    ["netstat", "-tulnp"],
-                    host=host,
-                )
-
-                if returncode == 0 and stdout:
-                    info = []
-                    info.append("=== Listening Ports ===\n")
-                    info.append(stdout)
-                    return "\n".join(info)
-                else:
-                    return "Error: Neither ss nor netstat command available on remote host"
-        else:
-            # Local execution - use psutil
-            info = []
-            info.append("=== Listening Ports ===\n")
-            info.append(f"{'Proto':<8} {'Local Address':<30} {'Status':<15} {'PID/Program'}")
-            info.append("-" * 80)
-
-            # Get connections in LISTEN state
-            connections = psutil.net_connections(kind="inet")
-            listening = [c for c in connections if c.status == "LISTEN" or c.type == socket.SOCK_DGRAM]
-
-            for conn in listening:
-                proto = "TCP" if conn.type == socket.SOCK_STREAM else "UDP"
-
-                local_addr = f"{conn.laddr.ip}:{conn.laddr.port}" if conn.laddr else "N/A"
-                status = conn.status if conn.status else "LISTENING"
-
-                # Try to get process info
-                pid_info = str(conn.pid) if conn.pid else "N/A"
-                if conn.pid:
-                    try:
-                        proc = psutil.Process(conn.pid)
-                        pid_info = f"{conn.pid}/{proc.name()}"
-                    except (psutil.NoSuchProcess, psutil.AccessDenied):
-                        pass
-
-                info.append(f"{proto:<8} {local_addr:<30} {status:<15} {pid_info}")
-
-            info.append(f"\n\nTotal listening ports: {len(listening)}")
-
-            return "\n".join(info)
-    except psutil.AccessDenied:
-        return "Permission denied. This tool requires elevated privileges to view all listening ports."
+        if returncode == 0 and stdout:
+            ports = parse_ss_listening(stdout)
+            return format_listening_ports(ports)
+        return f"Error getting listening ports: return code {returncode}, stderr: {stderr}"
     except Exception as e:
         return f"Error getting listening ports: {str(e)}"

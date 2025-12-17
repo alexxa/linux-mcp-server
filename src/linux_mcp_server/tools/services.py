@@ -6,7 +6,13 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from linux_mcp_server.audit import log_tool_call
+from linux_mcp_server.commands import get_command
+from linux_mcp_server.commands import substitute_command_args
 from linux_mcp_server.connection.ssh import execute_command
+from linux_mcp_server.formatters import format_service_logs
+from linux_mcp_server.formatters import format_service_status
+from linux_mcp_server.formatters import format_services_list
+from linux_mcp_server.parsers import parse_service_count
 from linux_mcp_server.server import mcp
 from linux_mcp_server.utils.decorators import disallow_local_execution_in_containers
 from linux_mcp_server.utils.types import Host
@@ -27,30 +33,24 @@ async def list_services(
     List all systemd services.
     """
     try:
-        # Run systemctl to list all services
-        returncode, stdout, stderr = await execute_command(
-            ["systemctl", "list-units", "--type=service", "--all", "--no-pager"],
-            host=host,
-        )
+        cmd = get_command("list_services")
+        returncode, stdout, stderr = await execute_command(cmd.args, host=host)
 
         if returncode != 0:
             return f"Error listing services: {stderr}"
 
-        # Format the output
-        result = ["=== System Services ===\n"]
-        result.append(stdout)
-
-        # Get summary
+        # Get running services count
+        running_cmd = get_command("running_services")
         returncode_summary, stdout_summary, _ = await execute_command(
-            ["systemctl", "list-units", "--type=service", "--state=running", "--no-pager"],
+            running_cmd.args,
             host=host,
         )
 
+        running_count = None
         if returncode_summary == 0:
-            running_count = len([line for line in stdout_summary.split("\n") if ".service" in line])
-            result.append(f"\n\nSummary: {running_count} services currently running")
+            running_count = parse_service_count(stdout_summary)
 
-        return "\n".join(result)
+        return format_services_list(stdout, running_count)
     except FileNotFoundError:
         return "Error: systemctl command not found. This tool requires systemd."
     except Exception as e:
@@ -76,11 +76,10 @@ async def get_service_status(
         if not service_name.endswith(".service") and "." not in service_name:
             service_name = f"{service_name}.service"
 
-        # Run systemctl status
-        _, stdout, stderr = await execute_command(
-            ["systemctl", "status", service_name, "--no-pager", "--full"],
-            host=host,
-        )
+        cmd = get_command("service_status")
+        args = substitute_command_args(cmd.args, service_name=service_name)
+
+        _, stdout, stderr = await execute_command(args, host=host)
 
         # Note: systemctl status returns non-zero for inactive services, but that's expected
         if not stdout and stderr:
@@ -89,10 +88,7 @@ async def get_service_status(
                 return f"Service '{service_name}' not found on this system."
             return f"Error getting service status: {stderr}"
 
-        result = [f"=== Status of {service_name} ===\n"]
-        result.append(stdout)
-
-        return "\n".join(result)
+        return format_service_status(stdout, service_name)
     except FileNotFoundError:
         return "Error: systemctl command not found. This tool requires systemd."
     except Exception as e:
@@ -122,11 +118,10 @@ async def get_service_logs(
         if not service_name.endswith(".service") and "." not in service_name:
             service_name = f"{service_name}.service"
 
-        # Run journalctl for the service
-        returncode, stdout, stderr = await execute_command(
-            ["journalctl", "-u", service_name, "-n", str(lines), "--no-pager"],
-            host=host,
-        )
+        cmd = get_command("service_logs")
+        args = substitute_command_args(cmd.args, service_name=service_name, lines=lines)
+
+        returncode, stdout, stderr = await execute_command(args, host=host)
 
         if returncode != 0:
             if "not found" in stderr.lower() or "no entries" in stderr.lower():
@@ -136,10 +131,7 @@ async def get_service_logs(
         if not stdout or stdout.strip() == "":
             return f"No log entries found for service '{service_name}'."
 
-        result = [f"=== Last {lines} log entries for {service_name} ===\n"]
-        result.append(stdout)
-
-        return "\n".join(result)
+        return format_service_logs(stdout, service_name, lines)
     except FileNotFoundError:
         return "Error: journalctl command not found. This tool requires systemd."
     except Exception as e:

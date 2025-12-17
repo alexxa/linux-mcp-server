@@ -1,8 +1,13 @@
 """Tests for system information tools."""
 
+import sys
+
+import pytest
+
 from linux_mcp_server.tools import system_info
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux commands")
 class TestSystemInfo:
     """Test system information tools."""
 
@@ -65,6 +70,7 @@ class TestSystemInfo:
         assert "filesystem" in result.lower() or "device" in result.lower() or "mounted" in result.lower()
         assert "/" in result  # Should at least show root filesystem
 
+    @pytest.mark.skipif(sys.platform != "linux", reason="Only passes no Linux")
     async def test_get_hardware_info_returns_string(self):
         """Test that get_hardware_information returns a string."""
         result = await system_info.get_hardware_information()
