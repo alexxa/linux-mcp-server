@@ -14,6 +14,7 @@ on:
 permissions:
   contents: read
   pull-requests: read
+  statuses: write
 
 jobs:
   check-authorization:
@@ -56,6 +57,8 @@ jobs:
 
     steps:
       - name: Run TF request tests
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "Starting functional tests..."
 
@@ -64,7 +67,6 @@ jobs:
             GIT_REF="${{ github.event.pull_request.head.sha }}"
           elif [[ "${{ github.event_name }}" == "issue_comment" ]]; then
             export PR_API_URL="https://api.github.com/repos/${{ github.repository }}/pulls/${{ github.event.issue.number }}"
-            export GITHUB_TOKEN="${{ secrets.GITHUB_TOKEN }}"
 
             PR_DATA=$(python3 -c "import urllib.request, json, os; req = urllib.request.Request(os.environ['PR_API_URL'], headers={'Authorization': 'Bearer ' + os.environ['GITHUB_TOKEN']}); print(json.dumps(json.loads(urllib.request.urlopen(req).read().decode('utf-8'))))")
 
@@ -75,13 +77,50 @@ jobs:
             GIT_REF="${{ github.sha }}"
           fi
 
-          TESTING_FARM_API_TOKEN=$TESTING_FARM_API_TOKEN testing-farm request \
+          export GIT_REF
+
+          update_status() {
+            if [[ "${{ github.event_name }}" == "issue_comment" ]]; then
+              local state=$1
+              local description=$2
+              python3 -c "
+import urllib.request, json, os
+req = urllib.request.Request(
+    f'https://api.github.com/repos/{os.environ[\"GITHUB_REPOSITORY\"]}/statuses/{os.environ[\"GIT_REF\"]}',
+    data=json.dumps({
+        'state': '$state',
+        'target_url': f'{os.environ.get(\"GITHUB_SERVER_URL\", \"https://github.com\")}/{os.environ[\"GITHUB_REPOSITORY\"]}/actions/runs/{os.environ[\"GITHUB_RUN_ID\"]}',
+        'description': '$description',
+        'context': 'Functional Tests (Testing Farm)'
+    }).encode('utf-8'),
+    headers={
+        'Authorization': f'Bearer {os.environ[\"GITHUB_TOKEN\"]}',
+        'Content-Type': 'application/json'
+    },
+    method='POST'
+)
+try:
+    urllib.request.urlopen(req)
+except Exception as e:
+    print(f'Warning: Failed to update commit status: {e}')
+"
+            fi
+          }
+
+          update_status "pending" "Testing Farm tests are running"
+
+          if TESTING_FARM_API_TOKEN=$TESTING_FARM_API_TOKEN testing-farm request \
             --git-url "$GIT_URL" \
             --git-ref "$GIT_REF" \
             --arch "$ARCH" \
             --compose "$COMPOSE" \
             --tag BusinessUnit=rhel_sst_lightspeed@downstream \
             --plan "$PLAN" \
-            --timeout 120
-
-          echo "Functional tests finished!"
+            --timeout 120; then
+            update_status "success" "Testing Farm tests passed"
+            echo "Functional tests finished successfully!"
+          else
+            update_status "failure" "Testing Farm tests failed"
+            echo "Functional tests failed!"
+            exit 1
+          fi
