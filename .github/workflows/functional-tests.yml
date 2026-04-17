@@ -96,22 +96,45 @@ jobs:
 
             core.exportVariable('GIT_URL', gitUrl);
             core.exportVariable('GIT_REF', gitRef);
-      - name: Run TF request tests
+      - name: Schedule test on Testing Farm
         id: tf-request
-        env:
-          TESTING_FARM_API_TOKEN: ${{ secrets.TESTING_FARM_API_TOKEN }}
-          ARCH: x86_64
-          COMPOSE: Fedora-43
-          PLAN: general
+        uses: sclorg/testing-farm-as-github-action@270f0d1d89dad513588fb5cc2cdd512c3459f3fe # v3
+        with:
+          api_key: ${{ secrets.TESTING_FARM_API_TOKEN }}
+          git_url: ${{ env.GIT_URL }}
+          git_ref: ${{ env.GIT_REF }}
+          arch: x86_64
+          compose: Fedora-43
+          tmt_plan_regex: general
+          environment_settings: '{"provision": {"tags": {"BusinessUnit": "rhel_sst_lightspeed@downstream"}}}'
+          update_pull_request_status: true
+
+      - name: Download xUnit results
+        if: always()
         run: |
-          echo "Starting functional tests..."
-          podman run --rm \
-            -e TESTING_FARM_API_TOKEN="$TESTING_FARM_API_TOKEN" \
-            quay.io/testing-farm/cli testing-farm request \
-            --git-url "$GIT_URL" \
-            --git-ref "$GIT_REF" \
-            --arch "$ARCH" \
-            --compose "$COMPOSE" \
-            --tag "BusinessUnit=rhel_sst_lightspeed@downstream" \
-            --plan "$PLAN" \
-            --timeout 120
+          REQUEST_URL="${{ steps.tf-request.outputs.request_url }}"
+          if [[ -n "$REQUEST_URL" ]]; then
+            echo "Downloading xUnit results from $REQUEST_URL/results.xml"
+            # -f ensures curl fails on 404/500 errors.
+            if curl -sSLf -o results.xml "$REQUEST_URL/results.xml"; then
+              # Validate it's actually an XML file (not a generic HTML error page)
+              if head -n 1 results.xml | grep -q '<?xml'; then
+                echo "Successfully downloaded and validated results.xml"
+              else
+                echo "results.xml downloaded but appears corrupted or is not XML."
+                rm -f results.xml
+              fi
+            else
+              echo "Failed to download results.xml (File may not exist if tests crashed early)."
+            fi
+          else
+            echo "No request URL output found from Testing Farm."
+          fi
+
+      - name: Upload Test Results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: functional-test-results
+          path: results.xml
+          retention-days: 14
